@@ -1,0 +1,8 @@
+{
+  "name": "photon-auth-gateway-vercel",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "axios": "^1.7.2"
+  }
+}
