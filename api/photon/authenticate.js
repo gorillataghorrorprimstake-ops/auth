@@ -45,68 +45,51 @@ async function isBanned(playFabId) {
     }
 }
 
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// Mirrors the retry pattern CloudScript's checkAntiUnityPass() already uses
-// (ANTIUNITY_READ_RETRY_COUNT / ANTIUNITY_READ_RETRY_DELAY_MS) - the client's
-// AntiUnity device-check write can lag a few seconds behind login, so a single
-// immediate read here was rejecting legitimate players who just hadn't had
-// their AntiUnityAuthPass key written yet. Delay is shorter than CloudScript's
-// 5s since this runs inline in Photon's connect path, not a background sweep.
-const ANTIUNITY_READ_RETRY_COUNT = 2;
-const ANTIUNITY_READ_RETRY_DELAY_MS = 1500;
-const ANTIUNITY_MAX_AGE_MS = 12 * 60 * 60 * 1000; // keep in sync with CloudScript
-
-async function readAntiUnityPassRaw(playFabId) {
-    const data = await playfabServerPost("GetUserInternalData", {
-        PlayFabId: playFabId,
-        Keys: ["AntiUnityAuthPass"]
-    });
-
-    return data && data.data && data.data.Data && data.data.Data.AntiUnityAuthPass &&
-        data.data.Data.AntiUnityAuthPass.Value;
-}
-
 async function hasValidAntiUnityPass(playFabId) {
-    for (let attempt = 0; attempt <= ANTIUNITY_READ_RETRY_COUNT; attempt++) {
-        try {
-            const raw = await readAntiUnityPassRaw(playFabId);
+    try {
+        const data = await playfabServerPost("GetUserInternalData", {
+            PlayFabId: playFabId,
+            Keys: ["AntiUnityAuthPass"]
+        });
 
-            if (raw) {
-                const record = JSON.parse(raw);
-                return record.passed === true && (Date.now() - record.timestamp) < ANTIUNITY_MAX_AGE_MS;
-            }
-        } catch (e) {
-            console.error("[hasValidAntiUnityPass] lookup failed (attempt " + attempt + "):", e.message);
-        }
+        const raw = data && data.data && data.data.Data && data.data.Data.AntiUnityAuthPass &&
+            data.data.Data.AntiUnityAuthPass.Value;
 
-        if (attempt < ANTIUNITY_READ_RETRY_COUNT) {
-            await sleep(ANTIUNITY_READ_RETRY_DELAY_MS);
-        }
+        if (!raw) return false;
+
+        const record = JSON.parse(raw);
+        const MAX_AGE_MS = 12 * 60 * 60 * 1000; // keep in sync with CloudScript
+        return record.passed === true && (Date.now() - record.timestamp) < MAX_AGE_MS;
+    } catch (e) {
+        console.error("[hasValidAntiUnityPass] lookup failed:", e.message);
+        return false; // fail closed
     }
-
-    return false; // still fail closed after retries
 }
 
-function reject(res, message) {
-    // Photon expects HTTP 200 with ResultCode 0 for an auth failure - a 4xx/5xx
-    // gets treated as "auth service unavailable", a different failure mode.
-    return res.status(200).json({ ResultCode: 0, Message: message });
+// Photon's Custom Authentication contract only recognizes three ResultCode
+// values (this is distinct from Photon's separate room "Webhooks" feature,
+// which does use 0 for success/ack - easy to mix the two up):
+//   1 = auth OK        (must include UserId)
+//   2 = auth failed
+//   3 = invalid/missing parameters
+// Anything else (including 0) isn't a code Photon's Custom Auth handler
+// understands, and can cause it to misbehave on the client's next connect
+// attempt rather than cleanly reporting OnCustomAuthenticationFailed.
+function reject(res, message, resultCode = 2) {
+    return res.status(200).json({ ResultCode: resultCode, Message: message });
 }
 
 module.exports = async function handler(req, res) {
     if (!TITLE_ID || !SECRET_KEY) {
         console.error("Missing PLAYFAB_TITLE_ID or PLAYFAB_SECRET_KEY env vars.");
-        return reject(res, "Server misconfigured.");
+        return reject(res, "Server misconfigured.", 2);
     }
 
     const playFabId = req.query.username;
     const photonToken = req.query.token;
 
     if (!playFabId || !photonToken) {
-        return reject(res, "Missing username/token parameters.");
+        return reject(res, "Missing username/token parameters.", 3);
     }
 
     // Step 1: confirm the Photon token is legit via PlayFab's real endpoint.
@@ -119,13 +102,13 @@ module.exports = async function handler(req, res) {
         playfabResult = upstream.data;
     } catch (e) {
         console.error("[gateway] PlayFab upstream call failed:", e.message);
-        return reject(res, "Upstream auth service unavailable.");
+        return reject(res, "Upstream auth service unavailable.", 2);
     }
 
     if (!playfabResult || playfabResult.ResultCode !== 1) {
         // Don't forward PlayFab's full error object - it can carry extra fields
         // that push past Photon's response size cap. Short reason only.
-        return reject(res, "PlayFab auth failed.");
+        return reject(res, "PlayFab auth failed.", 2);
     }
 
     // Step 2: our own extra gate.
@@ -135,11 +118,11 @@ module.exports = async function handler(req, res) {
     ]);
 
     if (banned) {
-        return reject(res, "Player is banned.");
+        return reject(res, "Player is banned.", 2);
     }
 
     if (!hasPass) {
-        return reject(res, "No valid AntiUnity ticket - device check must pass before Photon.");
+        return reject(res, "No valid AntiUnity ticket - device check must pass before Photon.", 2);
     }
 
     // Everything checked out. Return ONLY what Photon's Custom Auth contract
