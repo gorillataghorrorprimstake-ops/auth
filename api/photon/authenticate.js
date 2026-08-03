@@ -45,25 +45,49 @@ async function isBanned(playFabId) {
     }
 }
 
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Mirrors the retry pattern CloudScript's checkAntiUnityPass() already uses
+// (ANTIUNITY_READ_RETRY_COUNT / ANTIUNITY_READ_RETRY_DELAY_MS) - the client's
+// AntiUnity device-check write can lag a few seconds behind login, so a single
+// immediate read here was rejecting legitimate players who just hadn't had
+// their AntiUnityAuthPass key written yet. Delay is shorter than CloudScript's
+// 5s since this runs inline in Photon's connect path, not a background sweep.
+const ANTIUNITY_READ_RETRY_COUNT = 2;
+const ANTIUNITY_READ_RETRY_DELAY_MS = 1500;
+const ANTIUNITY_MAX_AGE_MS = 12 * 60 * 60 * 1000; // keep in sync with CloudScript
+
+async function readAntiUnityPassRaw(playFabId) {
+    const data = await playfabServerPost("GetUserInternalData", {
+        PlayFabId: playFabId,
+        Keys: ["AntiUnityAuthPass"]
+    });
+
+    return data && data.data && data.data.Data && data.data.Data.AntiUnityAuthPass &&
+        data.data.Data.AntiUnityAuthPass.Value;
+}
+
 async function hasValidAntiUnityPass(playFabId) {
-    try {
-        const data = await playfabServerPost("GetUserInternalData", {
-            PlayFabId: playFabId,
-            Keys: ["AntiUnityAuthPass"]
-        });
+    for (let attempt = 0; attempt <= ANTIUNITY_READ_RETRY_COUNT; attempt++) {
+        try {
+            const raw = await readAntiUnityPassRaw(playFabId);
 
-        const raw = data && data.data && data.data.Data && data.data.Data.AntiUnityAuthPass &&
-            data.data.Data.AntiUnityAuthPass.Value;
+            if (raw) {
+                const record = JSON.parse(raw);
+                return record.passed === true && (Date.now() - record.timestamp) < ANTIUNITY_MAX_AGE_MS;
+            }
+        } catch (e) {
+            console.error("[hasValidAntiUnityPass] lookup failed (attempt " + attempt + "):", e.message);
+        }
 
-        if (!raw) return false;
-
-        const record = JSON.parse(raw);
-        const MAX_AGE_MS = 12 * 60 * 60 * 1000; // keep in sync with CloudScript
-        return record.passed === true && (Date.now() - record.timestamp) < MAX_AGE_MS;
-    } catch (e) {
-        console.error("[hasValidAntiUnityPass] lookup failed:", e.message);
-        return false; // fail closed
+        if (attempt < ANTIUNITY_READ_RETRY_COUNT) {
+            await sleep(ANTIUNITY_READ_RETRY_DELAY_MS);
+        }
     }
+
+    return false; // still fail closed after retries
 }
 
 function reject(res, message) {
