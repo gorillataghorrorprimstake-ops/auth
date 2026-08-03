@@ -95,19 +95,35 @@ module.exports = async function handler(req, res) {
     // Step 1: confirm the Photon token is legit via PlayFab's real endpoint.
     let playfabResult;
     try {
+        console.log(`[gateway] calling PlayFab /photon/authenticate for playFabId=${playFabId} token=${photonToken.slice(0, 8)}...`);
         const upstream = await axios.get(`${PLAYFAB_BASE}/photon/authenticate`, {
             params: { username: playFabId, token: photonToken },
             timeout: 5000
         });
         playfabResult = upstream.data;
+        // TEMP DEBUG: log PlayFab's raw response so we can see the actual
+        // rejection reason instead of just "PlayFab auth failed." Remove
+        // once the underlying issue is confirmed and fixed - this can leak
+        // token/UserId fragments into logs if left on long-term.
+        console.log("[gateway] PlayFab response:", JSON.stringify(playfabResult));
     } catch (e) {
-        console.error("[gateway] PlayFab upstream call failed:", e.message);
+        // axios throws on non-2xx by default, so a PlayFab-side error (4xx/5xx)
+        // lands here too, not just network failures. Log status + body if present.
+        if (e.response) {
+            console.error(
+                `[gateway] PlayFab upstream call returned ${e.response.status}:`,
+                JSON.stringify(e.response.data)
+            );
+        } else {
+            console.error("[gateway] PlayFab upstream call failed:", e.message);
+        }
         return reject(res, "Upstream auth service unavailable.", 2);
     }
 
     if (!playfabResult || playfabResult.ResultCode !== 1) {
         // Don't forward PlayFab's full error object - it can carry extra fields
         // that push past Photon's response size cap. Short reason only.
+        console.error("[gateway] PlayFab rejected auth. Full response logged above this line.");
         return reject(res, "PlayFab auth failed.", 2);
     }
 
