@@ -99,7 +99,9 @@ module.exports = async function handler(req, res) {
     }
 
     if (!playfabResult || playfabResult.ResultCode !== 1) {
-        return res.status(200).json(playfabResult || { ResultCode: 0, Message: "PlayFab auth failed." });
+        // Don't forward PlayFab's full error object - it can carry extra fields
+        // that push past Photon's response size cap. Short reason only.
+        return reject(res, "PlayFab auth failed.");
     }
 
     // Step 2: our own extra gate.
@@ -116,6 +118,17 @@ module.exports = async function handler(req, res) {
         return reject(res, "No valid AntiUnity ticket - device check must pass before Photon.");
     }
 
-    // Everything checked out - forward PlayFab's original success response unchanged.
-    return res.status(200).json(playfabResult);
+    // Everything checked out. Return ONLY what Photon's Custom Auth contract
+    // actually needs - not PlayFab's full response object, which can include
+    // a Data/EntityToken blob large enough to trip Photon's response size cap
+    // ("http response max size exceeded").
+    const minimalResponse = {
+        ResultCode: 1,
+        UserId: playfabResult.UserId || playFabId
+    };
+    if (playfabResult.Nickname) {
+        minimalResponse.Nickname = playfabResult.Nickname;
+    }
+
+    return res.status(200).json(minimalResponse);
 };
