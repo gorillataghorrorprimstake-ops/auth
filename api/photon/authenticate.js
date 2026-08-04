@@ -104,7 +104,6 @@ async function sendAuthStatus({ outcome, success, playFabId, ip, detail }) {
         color: success ? 3066993 : 15105570, // green / orange
         fields: [
             { name: "PlayFabId", value: playFabId || "unknown", inline: true },
-            { name: "IP", value: ip || "unknown", inline: true },
             { name: "Outcome", value: outcome, inline: true },
             ...(detail ? [{ name: "Detail", value: String(detail).slice(0, 500), inline: false }] : []),
         ],
