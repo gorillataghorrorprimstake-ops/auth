@@ -6,13 +6,21 @@
 //   - per-IP and per-PlayFabId sliding-window rate limits (Upstash Redis)
 //   - short-TTL cache of AntiUnityAuthPass lookups to cut PlayFab calls under burst
 //   - auto-ban + Discord alert on sustained abuse from one identity/IP
+//   - EVERY auth outcome (success, failure, ban) posted to Discord as a status log
 //
 // Env vars required:
 //   PLAYFAB_TITLE_ID
 //   PLAYFAB_SECRET_KEY
 //   UPSTASH_REDIS_REST_URL
 //   UPSTASH_REDIS_REST_TOKEN
-//   ABUSE_ALERT_WEBHOOK_URL   (optional - Discord webhook)
+//   ABUSE_ALERT_WEBHOOK_URL     (optional - Discord webhook for abuse/ban alerts)
+//   AUTH_STATUS_WEBHOOK_URL     (optional - Discord webhook for every auth attempt)
+//
+// IMPORTANT: put webhook URLs in Vercel's Environment Variables UI (or .env.local,
+// which must stay in .gitignore). Never hardcode or "encode" a live webhook URL
+// into source — that's exactly the kind of secret GitHub's push-protection /
+// secret scanning is designed to catch, and any reversible encoding (base32,
+// base64, rot13, etc.) does nothing to actually protect it once it's committed.
 
 const axios = require("axios");
 const { Redis } = require("@upstash/redis");
@@ -21,6 +29,7 @@ const TITLE_ID = process.env.PLAYFAB_TITLE_ID;
 const SECRET_KEY = process.env.PLAYFAB_SECRET_KEY;
 const PLAYFAB_BASE = `https://${TITLE_ID}.playfabapi.com`;
 const ABUSE_ALERT_WEBHOOK_URL = process.env.ABUSE_ALERT_WEBHOOK_URL;
+const AUTH_STATUS_WEBHOOK_URL = process.env.AUTH_STATUS_WEBHOOK_URL;
 
 const redis = new Redis({
     url: process.env.KV_REST_API_URL,
@@ -35,6 +44,11 @@ const ABUSE_WINDOW_SEC = 120;
 const ABUSE_BAN_HOURS = 24;
 const PASS_CACHE_TTL_SEC = 20;                       // cache a passing AntiUnity check briefly
 const PLAYFABID_RE = /^[0-9A-F]{16}$/i;               // PlayFab IDs are 16 hex chars
+
+// Status-log tunables — keep this from becoming a spam cannon into Discord
+// under a CCU flood. Only fire status pings while under the per-IP limit;
+// once someone's rate-limited we already emit a separate one-time alert.
+const STATUS_LOG_ENABLED = !!AUTH_STATUS_WEBHOOK_URL;
 
 async function playfabServerPost(path, body) {
     const resp = await axios.post(`${PLAYFAB_BASE}/Server/${path}`, body, {
@@ -63,20 +77,39 @@ async function bumpCounter(key, windowSec) {
     return count;
 }
 
-async function sendAbuseAlert(title, fields) {
-    if (!ABUSE_ALERT_WEBHOOK_URL) return;
+async function postToWebhook(url, embed) {
+    if (!url) return;
     try {
-        await axios.post(ABUSE_ALERT_WEBHOOK_URL, {
-            embeds: [{
-                title,
-                color: 15158332,
-                fields,
-                timestamp: new Date().toISOString(),
-            }],
-        });
+        await axios.post(url, { embeds: [embed] }, { timeout: 4000 });
     } catch (e) {
-        console.error("[abuse alert] webhook failed:", e.message);
+        console.error("[webhook] post failed:", e.message);
     }
+}
+
+async function sendAbuseAlert(title, fields) {
+    await postToWebhook(ABUSE_ALERT_WEBHOOK_URL, {
+        title,
+        color: 15158332, // red
+        fields,
+        timestamp: new Date().toISOString(),
+    });
+}
+
+// Fired for every completed auth attempt (success or failure) once past
+// shape validation. `outcome` is a short machine-readable reason code.
+async function sendAuthStatus({ outcome, success, playFabId, ip, detail }) {
+    if (!STATUS_LOG_ENABLED) return;
+    await postToWebhook(AUTH_STATUS_WEBHOOK_URL, {
+        title: success ? "Photon auth success" : "Photon auth failed",
+        color: success ? 3066993 : 15105570, // green / orange
+        fields: [
+            { name: "PlayFabId", value: playFabId || "unknown", inline: true },
+            { name: "IP", value: ip || "unknown", inline: true },
+            { name: "Outcome", value: outcome, inline: true },
+            ...(detail ? [{ name: "Detail", value: String(detail).slice(0, 500), inline: false }] : []),
+        ],
+        timestamp: new Date().toISOString(),
+    });
 }
 
 async function autoBan(playFabId, ip, reason) {
@@ -161,7 +194,7 @@ module.exports = async function handler(req, res) {
     }
     if (!PLAYFABID_RE.test(playFabId)) {
         // Not even shaped like a real PlayFabId - don't waste a rate-limit
-        // slot or an upstream call on it, just bounce it.
+        // slot, an upstream call, or a webhook post on it, just bounce it.
         return reject(res, "Malformed identity.", 3);
     }
     if (typeof photonToken !== "string" || photonToken.length < 8 || photonToken.length > 512) {
@@ -207,18 +240,17 @@ module.exports = async function handler(req, res) {
         });
         playfabResult = upstream.data;
     } catch (e) {
-        if (e.response) {
-            console.error(`[gateway] PlayFab upstream returned ${e.response.status}:`, JSON.stringify(e.response.data));
-        } else {
-            console.error("[gateway] PlayFab upstream call failed:", e.message);
-        }
+        const detail = e.response ? `upstream ${e.response.status}` : e.message;
+        console.error("[gateway] PlayFab upstream call failed:", detail);
         await recordFailureAndMaybeBan(playFabId, ip);
+        await sendAuthStatus({ outcome: "upstream_error", success: false, playFabId, ip, detail });
         return reject(res, "Upstream auth service unavailable.", 2);
     }
 
     if (!playfabResult || playfabResult.resultCode !== 1) {
         console.error("[gateway] PlayFab rejected auth:", JSON.stringify(playfabResult));
         await recordFailureAndMaybeBan(playFabId, ip);
+        await sendAuthStatus({ outcome: "playfab_rejected", success: false, playFabId, ip });
         return reject(res, "PlayFab auth failed.", 2);
     }
 
@@ -229,11 +261,13 @@ module.exports = async function handler(req, res) {
     ]);
 
     if (banned) {
+        await sendAuthStatus({ outcome: "banned", success: false, playFabId, ip });
         return reject(res, "Player is banned.", 2);
     }
 
     if (!hasPass) {
         await recordFailureAndMaybeBan(playFabId, ip);
+        await sendAuthStatus({ outcome: "no_antiunity_pass", success: false, playFabId, ip });
         return reject(res, "No valid AntiUnity ticket - device check must pass before Photon.", 2);
     }
 
@@ -249,5 +283,8 @@ module.exports = async function handler(req, res) {
     if (playfabResult.nickname) {
         minimalResponse.Nickname = playfabResult.nickname;
     }
+
+    await sendAuthStatus({ outcome: "ok", success: true, playFabId, ip });
+
     return res.status(200).json(minimalResponse);
 };
